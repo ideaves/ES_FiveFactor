@@ -1,11 +1,14 @@
 # ES_FiveFactor
 Python for LSTM/TF on five time series. Initial results indicate that it's worth investing in making this
-approach into a python module, so I've gone ahead and tidied it up.
+approach into a python module, so I've gone ahead and tidied it up. Just drop in *.py, and a csv file with
+periodic data (5 minute assumptions may be partly baked in, and require a fix), for about 35000 time periods
+formatted like CurrentBars.csv. Decimal or fractional bond prices should work fine.
 
-This takes prices for five asset classes: stocks, US currency, Treasury bonds, gold, and Bitcoin, and inputs
-lagged values (one current, and eleven lagged) into a Tensorflow LSTM model. To do that effectively, 
-preserving the floating point nature of the pricing data, various bespoke normalizations had to be done, 
-including one to preserve a single-mode centralized distribution (without excessive skewness).
+This takes prices for five asset classes: stocks (E-mini futures), US currency, Treasury bonds, gold, and 
+Bitcoin, and inputs lagged values (one current, and eleven lagged) into a Tensorflow LSTM model. To do that 
+effectively, preserving the floating point nature of the pricing data, a bespoke normalization had to be 
+done, using asymmetric Winsorization to create an output range symmetric around zero, for the supervisory 
+series.
 
 The data for this are frankly, insufficient on their own to meaningfully drive an ANN-based model of this 
 size, even with in excess of 30k five-minute observations, easily enough to determine parameters, but not to 
@@ -28,3 +31,9 @@ genetic algorithm.
 I've obtained out of sample R-squareds in excess of 2% on individual models, which, with a pool 5 of them, 
 almost makes this a tradeable system. Obviously, the validity and out of sample performance of models 
 changes over time as market conditions change, and new market data are encountered.
+
+Directions for future research include a bigger and more highly powered pool of models of course. But more
+interestingly, an exploration of including a separate model for a look into the future output basis series, 
+optimizing those parameters alongside those of the predictive model. In effect, you'd be simultaneously 
+searching for whatever range or shape of prediction can be found that predicts most consistently on out of 
+sample data.
