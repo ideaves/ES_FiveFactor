@@ -1,5 +1,6 @@
 # ES_FiveFactor
-Python for LSTM/TF on five time series. If it's worthy, make classes and a module.
+Python for LSTM/TF on five time series. Initial results indicate that it's worth investing in making this
+approach into a python module, so I've gone ahead and tidied it up.
 
 This takes prices for five asset classes: stocks, US currency, Treasury bonds, gold, and Bitcoin, and inputs
 lagged values (one current, and eleven lagged) into a Tensorflow LSTM model. To do that effectively, 
