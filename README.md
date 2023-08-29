@@ -18,9 +18,11 @@ globally, even with the best hyperparameter tuning and randomized descent method
 
 To address this, a pool of such models are started, and kept in a fixed-size "gene pool" of them, so to 
 speak. The "fitness" criterion is the out of sample fit on the evaluation data set, the data excluded from 
-the LSTM model's training set. The training set is always the oldest contiguous time series data, and by far 
-the largest. The evaluation data set always comes disjointly right afterwards, up to the concurrent forecast 
-support data.
+the LSTM model's training set. The fitness criterion allows for risk aversity with respect to variability of 
+the out of sample performances, and with respect to the opportunity cost of keeping a model, when there is a 
+fixed gene pool size and there may be opportunities constrained to be left unexplored. The training set is 
+always the oldest contiguous time series data, and by far the largest. The evaluation data set always comes 
+disjointly right afterwards, up to the concurrent forecast support data.
 
 The actual learning therefore takes place in the context of the outer, genetic algorithm, which selects which
 of the ANN-based learning results is worthwhile on out of sample data. That inner learning cycle chooses
