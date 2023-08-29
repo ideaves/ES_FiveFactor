@@ -37,3 +37,11 @@ interestingly, an exploration of including a separate model for a look into the 
 optimizing those parameters alongside those of the predictive model. In effect, you'd be simultaneously 
 searching for whatever range or shape of prediction can be found that predicts most consistently on out of 
 sample data.
+
+Training note: If you've downloaded this in order to assess the methodology, please be aware that it was 
+intended to train on live data. Every training, evaluation, and mutation selection cycle should encounter
+a set of market data from at least one time period forward from the prior cycle. Nothing will be harmed if
+that is not the case, but gradually the genetic algorithm wrapper will overfit for any evaluation data set
+that remains unchanged (ordering must be preserved, as it is a time series model - data randomization is  
+not an option). Currently, this cycles though five models about every 15-25 minutes using the CUDA in an 
+older desktop from about 2018. The market data is at five minute intervals, so this works nicely.
