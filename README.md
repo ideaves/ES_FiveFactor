@@ -37,13 +37,18 @@ changes over time as market conditions change, and new market data are encounter
 Directions for future research include a bigger and more highly powered pool of models of course. But more
 interestingly, an exploration of including a separate model for a look into the future output basis series, 
 optimizing those parameters alongside those of the predictive model. In effect, you'd be simultaneously 
-searching for whatever range or shape of prediction can be found that predicts most consistently on out of 
-sample data.
+searching for whatever kind of prediction can be found that predicts most consistently on out of sample data.
+
+The genetic algorithm is painfully slow, the main deficiency presenting itself being that it frequently has
+"prodigy" models that predict very well on one out of sample set, replace a whole line, and then fail to
+continue performing well, almost immediately. That means the main engine of mutation is not being selective
+enough. To address that, an "incubation pool" approach may be applied, where any new prodigies have to prove 
+themselves fit for some number of generations, or drop out and never replace any genetic line.
 
 Training note: If you've downloaded this in order to assess the methodology, please be aware that it was 
 intended to train on live data. Every training, evaluation, and mutation selection cycle should encounter
 a set of market data from at least one time period forward from the prior cycle. Nothing will be harmed if
 that is not the case, but gradually the genetic algorithm wrapper will overfit for any evaluation data set
-that remains unchanged (ordering must be preserved, as it is a time series model - data randomization is  
-not an option). Currently, this cycles though five models about every 15-25 minutes using the CUDA in an 
+that remains unchanged (ordering must be preserved, as it is a time series model - data randomization is
+not an option). Currently, this cycles though five models about every 15-25 minutes using the CUDA in an
 older desktop from about 2018. The market data is at five minute intervals, so this works nicely.
