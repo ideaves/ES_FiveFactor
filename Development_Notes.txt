@@ -1,0 +1,17 @@
+Note on genetic algorithm development:
+There is no gradient with this class of ranking based nonparametric optimization algorithm, but
+there is a rank ordered ability to distinguish "fitness". In this case, the fitness is an actual
+floating point number, so there happens by coincidence to exist a gradient, but the algorithm
+itself ignores it, selecting instead based on lexical rules related to fitness ordering.
+
+Using signed r-squared as a fitness criterion seems to experience something like the vanishing 
+gradient problems seen with parametric and numerically based optimization algorithms, like 
+Levensohn-Marquardt, ADAM, or any of the commonly used ANN optimizers. When new models are created 
+and the process begins, the effectiveness of ranking based on an r-squared very close to zero 
+results in an inability to meaningfully distinguish between fitnesses of different instances of 
+models.
+
+Instead, using the correlation coefficient, the square root of r-squared (a.k.a. r) gives greater
+ability to distinguish between fitnesses of mostly unfit or irrelevant overfitted models. As x 
+approaches zero, recall that the slope of both x^2 and x*abs(x) approach zero, while that of x 
+remains constant.
