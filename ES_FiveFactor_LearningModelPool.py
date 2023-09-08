@@ -5,6 +5,7 @@ import sys;
 from pathlib import Path
 import tensorflow as tf;
 from tensorflow import keras;
+from keras.models import Model;
 from keras.models import Sequential;
 from keras.models import clone_model;
 from keras.callbacks import EarlyStopping;
@@ -39,7 +40,7 @@ class ES_FiveFactor_LearningModelPool:
 
     def __init__(self):
 
-        self.DATASET_MAX = 30000
+        self.DATASET_MAX = 20000
         self.EVAL_SIZE = 5000
         self.EVAL_OVERLAP = 0
         self.NUM_TS_LAGS = 12
@@ -53,7 +54,8 @@ class ES_FiveFactor_LearningModelPool:
         self.COUNTS_AS_SIGNIFICANT = 0.8
         self.CLAMP_PEAK_OBJECTIVE = 0.7
         self.MIN_MODEL_MATURITY_TO_REPLACE = 5
-        self.MIN_MODEL_MATURITY_TO_REPRODUCE = 10
+        self.MIN_MODEL_MATURITY_TO_REPRODUCE = 6
+        self.MAX_MINRSQUARED_TO_SPAWN = 0.005
 
         # tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
         self.LOWER_ENV_ADAPTATION_SPEED = 1.0 / 10.0
@@ -68,6 +70,8 @@ class ES_FiveFactor_LearningModelPool:
         self.DATE_FORMAT = '%Y-%m-%d'
 
         self._models = []
+
+        self._incubation_pool = []
 
         starttime = datetime.datetime.now() +  + timedelta(days=-4*365)
         self.helper = FuturesHelper()
@@ -91,7 +95,7 @@ class ES_FiveFactor_LearningModelPool:
         self._logger.addHandler(fh)
 
 
-    def mainLoop(self):
+    def main_loop(self):
         obj_name = "ES"
 
         for model_place in range(self.MODEL_POOL_SIZE):
@@ -107,20 +111,21 @@ class ES_FiveFactor_LearningModelPool:
                         self._logger.info('Acquired new out of sample r-squared {:9.5f}, age={}'.format(float(items[0]), items[1]))
                         r_sq = float(items[0])
                         length = int(items[1])
+                        f.close()
                 self._models.append([model_place, array([r_sq] * length), model])
                 # self._logger.debug('Appended initial model from file to collection')
                 self._logger.info('Loading model from {}_model_{} with {}'.format(obj_name, model_place, r_sq))
             else:
                 # define model
                 self._logger.info('Re-creating new model')
-                self.initialize_new_model(model_place, self.NUM_FEATURES);
+                self.initialize_new_model(model_place);
 
         all_data = {}
 
         while True:  # (((timeofday.hour == 5 and timeofday.minute > 30) or (timeofday.hour > 6)) and (timeofday.hour < 23)):
             all_data = self.load_latest_data()
 
-            out_obj = self.prepare_objective(all_data[obj_name], all_data["timeidx"])
+            out_obj = self.prepare_objective(all_data["OBJ"], all_data["timeidx"])
 
             inp = self.divide_input_data_into_two_parts(all_data, obj_name)
 
@@ -131,7 +136,7 @@ class ES_FiveFactor_LearningModelPool:
             in_timeidx = inp[4]
 
 
-            outp = self.divide_output_data_into_two_parts(out_obj)  # output: don't care about the front app prediction stub
+            outp = self.divide_output_data_into_two_parts(out_obj)  
             self.out_train = outp[0]
             self.out_eval = outp[1]
             ftime = datetime.datetime.now()
@@ -146,44 +151,53 @@ class ES_FiveFactor_LearningModelPool:
                     f.write('{:9.6},{:9.6},{:9.6},{},{}'.format(mean(out_obj), avg_out_winsorized, std_out_winsorized, train_means, train_stds))
  
 
-            self.gauss_normalize_my_input_data(train_means, train_stds)
+            self.gauss_normalize_my_input_data(self._train_data, train_means, train_stds)
+            self.gauss_normalize_my_input_data(self._eval_data, train_means, train_stds)
             ###### Normalize the objective
             # de-mean and standardize output variance, i.e. so that (0,1)
             self._out_train_obj = [(x - avg_out_winsorized) / std_out_winsorized for x in self.out_train]
             self._out_eval_obj = [(x - avg_out_winsorized) / std_out_winsorized for x in self.out_eval]
 
-            self.pipeline_training_data()
+            self.pipeline_input_data(self._train_data)
+            self.pipeline_input_data(self._eval_data)
             ###### Pipeline the objective data into the output format
             self._out_train_obj = array(self._out_train_obj).reshape((self.DATASET_MAX, 1))
             self._out_eval_obj = array(self._out_eval_obj).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
 
             n_steps_in, n_steps_out = self.NUM_TS_LAGS, 1
 
-            self.predict_train_evaluate_select_models(avg_out_winsorized, 
+            self.new_generation_of_models(avg_out_winsorized, 
                                              std_out_winsorized, in_timeidx[len(in_timeidx) - 1], n_steps_in, n_steps_out)
 
 
 
-    def initialize_new_model(self, model_place, n_features):
+    def initialize_new_model(self, model_place):
         # define model
         #self._logger.debug('Re-creating new models')
+
         model = Sequential()
-        model.add(LSTM(120, activation='tanh', input_shape=(self.NUM_TS_LAGS, n_features)))
-        model.add(Activation("tanh"))
-        model.add(Dropout(0.25))
-        model.add(Dense(25))
-        model.add(Dropout(0.25))
-        model.add(Activation("tanh"))
-        model.add(Dropout(0.25))
-        model.add(Activation("tanh"))
-        model.add(Dense(1))
+        model.add(LSTM(self.NUM_TS_LAGS, activation='tanh', input_shape=(self.NUM_TS_LAGS, self.NUM_FEATURES))) #"ARI")
+        model.add(Dropout(0.25))                                # "integration_filter")
+        model.add(Dense(self.NUM_FEATURES * self.NUM_TS_LAGS))  # "condense_into_features_and_lags")
+        model.add(Activation('tanh'))                           # "MA")
+        model.add(Dropout(0.25))                                # "ARIMA_filter")
+        model.add(Activation("tanh"))                           # "subject")
+        model.add(Dropout(0.25))                                # "subject_filter")
+        model.add(Dense(self.NUM_FEATURES))                     # "patterns_1")
+        model.add(Dropout(0.25))                                # "pattern_1_filter")
+        model.add(Activation("tanh"))                           # "patterns_2")
+        model.add(Dropout(0.25))                                # "pattern_2_filter")
+        model.add(Dense(self.NUM_FEATURES))                     # "patterns_3")
+        model.add(Dropout(0.25))                                # "pattern_4_filter")
+        model.add(Activation("tanh"))                           # "output_patterns")
+        model.add(Dense(1))                                     # "output")
         model.compile(optimizer='adam', loss='mse')
-        # leaves models empty initially
+        # leaves model perfs empty initially
         self._models.append([model_place, array(0), model])
+        model.summary()
 
 
-
-    def load_latest_data(self):
+    def parse_input_data(self, data):
         in_timeidx = []
         in_ES = []
         in_EC = []
@@ -194,103 +208,121 @@ class ES_FiveFactor_LearningModelPool:
         in_GCS = []
         in_USS = []
         in_BC = []
+        out_obj = []
+        
+        esprice = None
+        ecprice = None
+        gcprice = None
+        usprice = None
+        bcprice = None
+        esprice2 = None
+        ecprice2 = None
+        gcprice2 = None
+        usprice2 = None
+        bcprice2 = None
+        timesnap = None
+        lastsnapshottime = None
 
-        out_ES = []
-        out_EC = []
-        out_GC = []
-        out_US = []
+        for rec in str.split(data, '\n', maxsplit=-1):
+            srec = str.split(rec, ',', maxsplit=-1)
+            if len(srec) < 3:
+                continue
+            symbol = srec[0].strip()
+            if symbol.startswith('NQ'): ## Data collection dependent. If it's there and not used, omit it.
+                continue
+            strtime = srec[1].strip()
+            times = str.split(strtime, ' ')
+            datepart = times[0]
+            timepart = times[1]
+            times = str.split(timepart, ':')
+            hour = times[0]
+            minute = times[1]
+            strprice = srec[2].strip()
+            ###### If it's a new timestamp: Initialize state variables, time instance i
+            ###### ###### Parse Futures state variable using state of time instance i
+            if (lastsnapshottime is None and timesnap is None) or (
+                    lastsnapshottime is not None and '{0} {1}:{2}:00'.format(datepart, hour,
+                                                                             minute) != timesnap):
+                # self._logger.debug('Resetting for a new time period with {} {}. lastsnapshottime={}, timesnap={}'.format(datepart, timepart, lastsnapshottime, timesnap))
+                esprice = None
+                ecprice = None
+                gcprice = None
+                usprice = None
+                bcprice = None
+                esprice2 = None
+                ecprice2 = None
+                gcprice2 = None
+                usprice2 = None
+                bcprice2 = None
+                esspread = None
+                ecspread = None
+                gcspread = None
+                usspread = None
+                bcspread = None
+                timesnap = '{0} {1}:{2}:00'.format(datepart, hour, minute)
 
-        lasthour = ''
-        lastmin = ''
-    
+            if symbol.find('ES') == 0:
+                esprice, esprice2, esspread = self.parse_ES_futures_price(strtime, symbol, strprice, esprice, esprice2)
+            elif symbol.find('EC') == 0:
+                ecprice, ecprice2, ecspread = self.parse_EC_futures_price(strtime, symbol, strprice, ecprice, ecprice2)
+            elif symbol.find('GC') == 0:
+                gcprice, gcprice2, gcspread = self.parse_GC_futures_price(strtime, symbol, strprice, gcprice, gcprice2)
+            elif symbol.find('US') == 0:
+                usprice, usprice2, usspread = self.parse_US_futures_price(strtime, symbol, strprice, usprice, usprice2)
+            elif symbol.find('BTC') == 0:
+                bcprice, bcprice2, bcspread = self.parse_BC_futures_price(strtime, symbol, strprice, bcprice, bcprice2)
+
+
+            if timesnap is not None and esprice is not None and esprice > 0 and ecprice is not None and ecprice > 0 \
+                    and esprice2 is not None and esprice2 > 0 and ecprice2 is not None and ecprice2 > 0 \
+                    and gcprice is not None and gcprice > 0 and usprice is not None and usprice > 0 \
+                    and gcprice2 is not None and gcprice2 > 0 and usprice2 is not None and usprice2 > 0 \
+                    and bcprice is not None and bcprice > 0 and bcprice2 is not None and bcprice2 > 0 \
+                    and esspread is not None and ecspread is not None and gcspread is not None and usspread is not None:
+                in_ES.append(esprice)
+                in_EC.append(ecprice)
+                in_GC.append(gcprice)
+                in_US.append(usprice)
+                in_BC.append(bcprice)
+                in_ESS.append(esspread)
+                in_ECS.append(ecspread)
+                in_GCS.append(gcspread)
+                in_USS.append(usspread)
+                in_timeidx.append(timesnap)
+
+                lastsnapshottime = timesnap
+
+        return {"ES": in_ES,
+                "EC": in_EC,
+                "GC": in_GC,
+                "US": in_US,
+                "ESS": in_ESS, "ECS": in_ECS, "GCS": in_GCS, "USS": in_USS,
+                "BC": in_BC,
+                "timeidx": in_timeidx,
+                "OBJ": in_ES}
+
+
+    def load_latest_data(self):    
         with open('5minuteBars.csv', encoding='utf-8') as f:
             data = f.read().strip()
             # self._logger.debug(data)
-            esprice = None
-            ecprice = None
-            gcprice = None
-            usprice = None
-            bcprice = None
-            esprice2 = None
-            ecprice2 = None
-            gcprice2 = None
-            usprice2 = None
-            bcprice2 = None
-            timesnap = None
-            lastsnapshottime = None
-
-            ###### Read Market Data input module
-            for rec in str.split(data, '\n', maxsplit=-1):
-                srec = str.split(rec, ',', maxsplit=-1)
-                if len(srec) < 3:
-                    continue
-                symbol = srec[0].strip()
-                if symbol.startswith('NQ'):
-                    continue
-                strtime = srec[1].strip()
-                times = str.split(strtime, ' ')
-                datepart = times[0]
-                timepart = times[1]
-                times = str.split(timepart, ':')
-                hour = times[0]
-                minute = times[1]
-                strprice = srec[2].strip()
-                ###### If it's a new timestamp: Initialize state variables, time instance i
-                ###### ###### Parse Futures state variable using state of time instance i
-                if (lastsnapshottime is None and timesnap is None) or (
-                        lastsnapshottime is not None and '{0} {1}:{2}:00'.format(datepart, hour,
-                                                                                 minute) != timesnap):
-                    # self._logger.debug('Resetting for a new time period with {} {}. lastsnapshottime={}, timesnap={}'.format(datepart, timepart, lastsnapshottime, timesnap))
-                    esprice = None
-                    ecprice = None
-                    gcprice = None
-                    usprice = None
-                    bcprice = None
-                    esprice2 = None
-                    ecprice2 = None
-                    gcprice2 = None
-                    usprice2 = None
-                    bcprice2 = None
-                    esspread = None
-                    ecspread = None
-                    gcspread = None
-                    usspread = None
-                    bcspread = None
-                    timesnap = '{0} {1}:{2}:00'.format(datepart, hour, minute)
-
-                if symbol.find('ES') == 0:
-                    esprice, esprice2, esspread = self.parse_ES_futures_price(strtime, symbol, strprice, esprice, esprice2)
-                elif symbol.find('EC') == 0:
-                    ecprice, ecprice2, ecspread = self.parse_EC_futures_price(strtime, symbol, strprice, ecprice, ecprice2)
-                elif symbol.find('GC') == 0:
-                    gcprice, gcprice2, gcspread = self.parse_GC_futures_price(strtime, symbol, strprice, gcprice, gcprice2)
-                elif symbol.find('US') == 0:
-                    usprice, usprice2, usspread = self.parse_US_futures_price(strtime, symbol, strprice, usprice, usprice2)
-                elif symbol.find('BTC') == 0:
-                    bcprice, bcprice2, bcspread = self.parse_BC_futures_price(strtime, symbol, strprice, bcprice, bcprice2)
+            return self.parse_input_data(data)
 
 
-                if timesnap is not None and esprice is not None and esprice > 0 and ecprice is not None and ecprice > 0 \
-                        and esprice2 is not None and esprice2 > 0 and ecprice2 is not None and ecprice2 > 0 \
-                        and gcprice is not None and gcprice > 0 and usprice is not None and usprice > 0 \
-                        and gcprice2 is not None and gcprice2 > 0 and usprice2 is not None and usprice2 > 0 \
-                        and bcprice is not None and bcprice > 0 and bcprice2 is not None and bcprice2 > 0 \
-                        and esspread is not None and ecspread is not None and gcspread is not None and usspread is not None:
-                    in_ES.append(esprice)
-                    in_EC.append(ecprice)
-                    in_GC.append(gcprice)
-                    in_US.append(usprice)
-                    in_BC.append(bcprice)
-                    in_ESS.append(esspread)
-                    in_ECS.append(ecspread)
-                    in_GCS.append(gcspread)
-                    in_USS.append(usspread)
-                    in_timeidx.append(timesnap)
-
-                    lastsnapshottime = timesnap
-
-        return {"ES": in_ES, "EC": in_EC, "GC": in_GC, "US": in_US, "ESS": in_ESS, "ECS": in_ECS, "GCS": in_GCS,
-                "USS": in_USS, "BC": in_BC, "timeidx": in_timeidx}
+    def load_current_data(self):
+        with open('CurrentBars.csv', encoding='utf-8') as f:
+            data = f.read().strip()
+            x = self.parse_input_data(data)
+            return self.parse_input_data(data)
+        #return {"ES": x["ES"],
+        #        "EC": x["EC"],
+        #        "GC": x["GC"],
+        #        "US": x["US"],
+        #        "ESS": x["ESS"], "ECS": x["ECS"], "GCS": x["GCS"], "USS": x["USS"],
+        #        "BC": x["BC"],
+        #        "timeidx": x["timeidx"]}
+        # Needs the extra objective series?
+            
 
 
     def parse_ES_futures_price(self, strtime, symbol, strprice, esprice, esprice2):
@@ -532,21 +564,21 @@ class ES_FiveFactor_LearningModelPool:
         return [train_data, eval_data, train_means, train_stds, in_timeidx]
 
 
-    def divide_output_data_into_two_parts(self, out_GC):
+    def divide_output_data_into_two_parts(self, objective):
         ###### De-mean output series
-        avg_out_GC = mean(out_GC)
-        out_GC[:] = [number - avg_out_GC for number in out_GC]
+        avg_output = mean(objective)
+        objective[:] = [number - avg_output for number in objective]
 
-        out_eval_GC = [number - avg_out_GC for number in out_GC]
+        out_eval = [number - avg_output for number in objective]
 
-        out_GC = self.symmetrically_bound_objective(out_GC, out_eval_GC, self.CLAMP_PEAK_OBJECTIVE)
+        objective = self.symmetrically_bound_objective(objective, out_eval, self.CLAMP_PEAK_OBJECTIVE)
 
-        # This removes the oldest observations from out_GC
-        out_GC = out_GC[len(out_GC) - self.DATASET_MAX - self.NUM_TS_LAGS - self.EVAL_SIZE - 2:len(out_GC) - self.NUM_TS_LAGS - self.EVAL_SIZE - 2]
+        # This snips off the oldest observations from objective, and puts the front extent into the eval set
+        objective = objective[len(objective) - self.DATASET_MAX - self.NUM_TS_LAGS - self.EVAL_SIZE - 1:len(objective) - self.NUM_TS_LAGS - self.EVAL_SIZE - 1]
     
-        out_eval_GC = out_GC.copy()[len(out_GC) - self.DATASET_MAX - self.NUM_TS_LAGS - self.EVAL_SIZE - self.EVAL_OVERLAP - 1:len(out_GC) - self.DATASET_MAX - self.NUM_TS_LAGS - 1]
+        out_eval = objective.copy()[len(objective) - self.DATASET_MAX - self.NUM_TS_LAGS - self.EVAL_SIZE - self.EVAL_OVERLAP:len(objective) - self.DATASET_MAX - self.NUM_TS_LAGS]
     
-        return [out_GC, out_eval_GC]
+        return [objective, out_eval]
 
 
     def symmetrically_bound_objective(self, sequence, alt_sequence, proportion):
@@ -577,52 +609,32 @@ class ES_FiveFactor_LearningModelPool:
         return sequence
 
 
-    def gauss_normalize_my_input_data(self, train_means, train_stds):
-        self._train_data["ES"] = [(x - train_means["ES"]) / train_stds["ES"] for x in self._train_data["ES"]]
-        self._train_data["EC"] = [(x - train_means["EC"]) / train_stds["EC"] for x in self._train_data["EC"]]
-        self._train_data["GC"] = [(x - train_means["GC"]) / train_stds["GC"] for x in self._train_data["GC"]]
-        self._train_data["US"] = [(x - train_means["US"]) / train_stds["US"] for x in self._train_data["US"]]
-        self._train_data["BC"] = [(x - train_means["BC"]) / train_stds["BC"] for x in self._train_data["BC"]]
-        self._train_data["ESS"] = [(x - train_means["ESS"]) / train_stds["ESS"] for x in self._train_data["ESS"]]
-        self._train_data["ECS"] = [(x - train_means["ECS"]) / train_stds["ECS"] for x in self._train_data["ECS"]]
-        self._train_data["GCS"] = [(x - train_means["GCS"]) / train_stds["GCS"] for x in self._train_data["GCS"]]
-        self._train_data["USS"] = [(x - train_means["USS"]) / train_stds["USS"] for x in self._train_data["USS"]]
+    # mutates input_data
+    def gauss_normalize_my_input_data(self, input_data, train_means, train_stds):
+        input_data["ES"] = [(x - train_means["ES"]) / train_stds["ES"] for x in input_data["ES"]]
+        input_data["EC"] = [(x - train_means["EC"]) / train_stds["EC"] for x in input_data["EC"]]
+        input_data["GC"] = [(x - train_means["GC"]) / train_stds["GC"] for x in input_data["GC"]]
+        input_data["US"] = [(x - train_means["US"]) / train_stds["US"] for x in input_data["US"]]
+        input_data["BC"] = [(x - train_means["BC"]) / train_stds["BC"] for x in input_data["BC"]]
+        input_data["ESS"] = [(x - train_means["ESS"]) / train_stds["ESS"] for x in input_data["ESS"]]
+        input_data["ECS"] = [(x - train_means["ECS"]) / train_stds["ECS"] for x in input_data["ECS"]]
+        input_data["GCS"] = [(x - train_means["GCS"]) / train_stds["GCS"] for x in input_data["GCS"]]
+        input_data["USS"] = [(x - train_means["USS"]) / train_stds["USS"] for x in input_data["USS"]]
 
 
-        self._eval_data["ES"] = [(x - train_means["ES"]) / train_stds["ES"] for x in self._eval_data["ES"]]
-        self._eval_data["EC"] = [(x - train_means["EC"]) / train_stds["EC"] for x in self._eval_data["EC"]]
-        self._eval_data["GC"] = [(x - train_means["GC"]) / train_stds["GC"] for x in self._eval_data["GC"]]
-        self._eval_data["US"] = [(x - train_means["US"]) / train_stds["US"] for x in self._eval_data["US"]]
-        self._eval_data["BC"] = [(x - train_means["BC"]) / train_stds["BC"] for x in self._eval_data["BC"]]
-        self._eval_data["ESS"] = [(x - train_means["ESS"]) / train_stds["ESS"] for x in self._eval_data["ESS"]]
-        self._eval_data["ECS"] = [(x - train_means["ECS"]) / train_stds["ECS"] for x in self._eval_data["ECS"]]
-        self._eval_data["GCS"] = [(x - train_means["GCS"]) / train_stds["GCS"] for x in self._eval_data["GCS"]]
-        self._eval_data["USS"] = [(x - train_means["USS"]) / train_stds["USS"] for x in self._eval_data["USS"]]
-
-
-    def pipeline_training_data(self):
+    # mutates input_data
+    def pipeline_input_data(self, input_data):
         # convert to [rows, columns] structure
         ###### Pipeline the training data into the input format
-        self._train_data["ES"] = array(self._train_data["ES"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["EC"] = array(self._train_data["EC"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["GC"] = array(self._train_data["GC"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["US"] = array(self._train_data["US"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["BC"] = array(self._train_data["BC"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["ESS"] = array(self._train_data["ESS"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["ECS"] = array(self._train_data["ECS"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["GCS"] = array(self._train_data["GCS"]).reshape((self.DATASET_MAX, 1))
-        self._train_data["USS"] = array(self._train_data["USS"]).reshape((self.DATASET_MAX, 1))
-
-        ###### Pipeline the eval data into the input format
-        self._eval_data["ES"] = array(self._eval_data["ES"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["EC"] = array(self._eval_data["EC"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["GC"] = array(self._eval_data["GC"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["US"] = array(self._eval_data["US"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["BC"] = array(self._eval_data["BC"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["ESS"] = array(self._eval_data["ESS"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["ECS"] = array(self._eval_data["ECS"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["GCS"] = array(self._eval_data["GCS"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
-        self._eval_data["USS"] = array(self._eval_data["USS"]).reshape((self.EVAL_SIZE + self.EVAL_OVERLAP, 1))
+        input_data["ES"] = array(input_data["ES"]).reshape((len(input_data["ES"]), 1))
+        input_data["EC"] = array(input_data["EC"]).reshape((len(input_data["EC"]), 1))
+        input_data["GC"] = array(input_data["GC"]).reshape((len(input_data["GC"]), 1))
+        input_data["US"] = array(input_data["US"]).reshape((len(input_data["US"]), 1))
+        input_data["BC"] = array(input_data["BC"]).reshape((len(input_data["BC"]), 1))
+        input_data["ESS"] = array(input_data["ESS"]).reshape((len(input_data["ESS"]), 1))
+        input_data["ECS"] = array(input_data["ECS"]).reshape((len(input_data["ECS"]), 1))
+        input_data["GCS"] = array(input_data["GCS"]).reshape((len(input_data["GCS"]), 1))
+        input_data["USS"] = array(input_data["USS"]).reshape((len(input_data["USS"]), 1))
 
 
 
@@ -644,12 +656,14 @@ class ES_FiveFactor_LearningModelPool:
 
 
     def model_fitness_score(self, eval_history):
-        return mean(eval_history[1]) - std(eval_history[1]) / 4 + log(eval_history[1].size) / 1000
+        #return mean(eval_history[1]) - std(eval_history[1]) / 4 + log(eval_history[1].size) / 1000
+        # desensitize the short end of the longevity virtue but keep about the same magnitude at low scale
+        return mean(eval_history[1]) - std(eval_history[1]) / 4 + log(eval_history[1].size + 99) / 5000
 
 
 
 
-    def predict_train_evaluate_select_models(self, avg_out_obj_winsorized, std_out_obj_winsorized, data_time,
+    def new_generation_of_models(self, avg_out_obj_winsorized, std_out_obj_winsorized, data_time,
                                              n_steps_in, n_steps_out):
         runtime = datetime.datetime.now()
         self._logger.info('Run time={} Data time={}'.format(runtime, data_time))
@@ -670,171 +684,359 @@ class ES_FiveFactor_LearningModelPool:
         n_features = X.shape[2]
         #self._logger.debug(X.shape)
 
-        average_rsq = 0
-        average_count = 0
+        ###### Model pool.  Have the model pool do the interaction, managing the genetic algo.
+        for model_place in range(len(self._models)):
 
-        ###### Model pool.  Have the model pool do the interation, managing the genetic algo.
-        for loop in range(self.MODEL_POOL_SIZE):
-            # horizontally stack columns
+            model = self._models[model_place][2]
+            # predict using the before model (call this the parent)
+            predictions, current_r_squared, child_r_squared, current_model_score = self.before_and_after_models(self._models, X, y, model, model_place, evalX, evaly)
 
-            if loop < len(self._models):
-                model = self._models[loop][2]
-                model_place = loop
-            else:
-                model_place = 0
-
-            # predict using the before model (parent)
-            predictions = model.predict(evalX, batch_size=1000, verbose=0)
-
-            slope, intercept, current_r_value, p_value, std_err = scipy.stats.linregress(
-                reshape(evaly, (1,-1)), reshape(predictions, (1,-1)))
-            current_r_squared = current_r_value*abs(current_r_value)
-
-            average_rsq += current_r_squared
-            average_count += 1
-
-            # Train
-            # Fit the next candidate model, and find its out of sample r-squared
-            stopping_rule = [
-                EarlyStopping(
-                    # Stop training when `loss` is no longer improving
-                    monitor="loss",
-                    # "no longer improving" being defined as "no better than 1e-2 less"
-                    min_delta=1e-2,
-                    # baseline=250,
-                    # "no longer improving" being further defined as "for at least 10 epochs"
-                    patience=200,
-                    verbose=0,
-                )
-            ]
-
-            rollback_model = clone_model(model)
-            result = model.fit(X, y, epochs=2000, batch_size=1000, validation_data=(evalX, evaly), verbose=0,
-                               callbacks=stopping_rule)
-
-            # last_price = train_data["GC"][len(train_data["GC"])-1]
-            # logger.write('{},{},{},{}\n'.format(in_timeidx[len(in_timeidx) - 1],
-            #                                       result.history['loss'][len(result.history['loss']) - 1],
-            #                                       (yhat[0][0] - avg_out_obj_winsorized) * std_out_obj_winsorized,
-            #                                       GC_last_price))
-
-            # Evaluate shild model for inheritance
-            predictions = model.predict(evalX, batch_size=1000, verbose=0)
-            slope, intercept, child_r_value, p_value, std_err = scipy.stats.linregress(
-                reshape(evaly, (1,-1)), reshape(predictions, (1,-1)))
-            child_r_squared = child_r_value*abs(child_r_value)
-
-            model_to_remove = None
-
-            if len(self._models) > 0:
-                MAX_OOS_RSQUARED = max([mean(x[1]) for x in self._models])
-
-            # Select
-            # Run the genetic fitness criteria. Prodigies replace a line if sufficiently awesome.
-            # If not, then if the child r-squareds is good enough, then it inherits, otherwise it reverts
-            # to the parent.
-            child_replaced_another_line = False
-
-            current_model_score = 0;
-    #        self._logger.debug(type(models[model_place][1]))
-            if self._models[model_place][1].size > 0:
-                current_model_score = self.model_fitness_score(self._models[model_place])
-
-            # Max of all the models including this one
+            # Max/min of all the model means 
             if len(self._models) > 0:
                 MAX_OOS_RSQUARED = max(mean(x[1]) for x in self._models)
+                MIN_OOS_RSQUARED = min(mean(x[1]) for x in self._models)
 
-            # Min of all the other models with more than MIN_MODEL_MATURITY_TO_REPLACE in history, if there are any
-            if len([x for x in self._models if x[1].size >= self.MIN_MODEL_MATURITY_TO_REPLACE and model_place != x[0]]) > 0:
-                MIN_OOS_RSQUARED = min(
-                    mean(x[1]) for x in [y for y in self._models if y[1].size >= self.MIN_MODEL_MATURITY_TO_REPLACE and model_place != y[0]])
-            else:
-                MIN_OOS_RSQUARED = 1000000  # never spawn
+            rollback_model = clone_model(model)
+            
+            # Run the genetic fitness criteria. Prodigies stand to replace a line if sufficiently awesome.
+            # If not, then if the child r-squared is good enough, it inherits, otherwise the line reverts
+            # to the parent.
+            child_should_incubate_a_new_line = False
 
             # Mature enough to spawn, and child is a prodigy
-            max_model_score = max(self.model_fitness_score(x) for x in self._models)
-            if self._models[model_place][1].size >= self.MIN_MODEL_MATURITY_TO_REPRODUCE and child_r_squared > MAX_OOS_RSQUARED and MIN_OOS_RSQUARED < 0.005:  # max_model_score:
-                # Must replace the worst score, among all > 4 cycles aged, and not its parent.
-                min_found = 10000000
-                worst_model_idx = -1
-                min_model_score = min(mean(x[1]) - std(x[1]) / 4 + log(x[1].size) / 1000 for x in self._models)
-                for place in range(len(self._models)):
-                    if mean(self._models[place][1]) - std(self._models[place][1]) / 4 + log(
-                            self._models[place][1].size) / 1000 <= min_found and self._models[place][1].size > 4:
-                        min_found = mean(self._models[place][1]) - std(self._models[place][1]) / 4 + log(
-                            self._models[place][1].size) / 1000
-                        worst_model_idx = place
+            if self._models[model_place][1].size >= self.MIN_MODEL_MATURITY_TO_REPRODUCE and child_r_squared > (MAX_OOS_RSQUARED) and MIN_OOS_RSQUARED < self.MAX_MINRSQUARED_TO_SPAWN:
+                inc_place = len(self._incubation_pool)
+                self._incubation_pool.append([inc_place, array(child_r_squared), clone_model(model)])
+                self._incubation_pool[inc_place][2].compile(optimizer='adam', loss='mse')
+                child_should_incubate_a_new_line = True
+            
+            secondary_inheritance_requirement = mean(self._models[model_place][1]) + std(self._models[model_place][1])
+            if not child_should_incubate_a_new_line:
+                # The child replaces the parent unless it spawned to incubate another genetic line, or
+                # unless it was inferior, i.e. < min(r, (historical mean r) + 1 std dev)
+                # Also cannot inherit with < 80% of any positive current value, no matter what - experimental
+                # Failed to inherit:
+                if (child_r_squared < current_r_squared and child_r_squared <= secondary_inheritance_requirement) or (child_r_squared < current_r_squared * 0.80 and current_r_squared > 0.0):
+                    # rollback
+                    try:
+                        self._models[model_place][1] = np.append(self._models[model_place][1], current_r_squared)
+                        self._models[model_place][2] = rollback_model
+                        self._models[model_place][2].compile(optimizer='adam', loss='mse')
+                    except Exception as ex:
+                        self._logger.debug('Exception thrown rolling back model:{} : {}'.format(type(ex), ex.args))
+                        self._logger.debug('Rolling back pool model {}'.format(model_place))
+                        self._logger.debug('Was {}'.format(self._models[model_place]))
 
-                if worst_model_idx > -1 and model_place != worst_model_idx:
-                    # Child should inherit, not replace its parent if it was the worst
-                    self._models[worst_model_idx] = [worst_model_idx, array(child_r_squared), clone_model(model)]
-                    self._models[worst_model_idx][2].compile(optimizer='adam', loss='mse')
-                    # TODO parameterize output series
-                    if Path('.\ES_model_loss_{}.csv'.format(worst_model_idx)).is_file():
-                        with open('.\ES_model_loss_{}.csv'.format(worst_model_idx), 'r+',
-                                  encoding='utf-8') as f:
-                            f.seek(0)
-                            f.write('{:9.6},1'.format(mean(self._models[worst_model_idx][1])))
-                    else:
-                        with open('.\ES_model_loss_{}.csv'.format(worst_model_idx), "w") as f:
-                            f.seek(0)
-                            f.write('{:9.6},1'.format(mean(self._models[worst_model_idx][1])))
-                    model.save('.\ES_model_{}'.format(worst_model_idx), save_format='h5')
-                    child_replaced_another_line = True
-
-            if not child_replaced_another_line:
-                # The child replaces the parent unless it replaced another model genetic line, or
-                # unless it was inferior, i.e. < min(r, historical mean r) - abs difference btw the two.
-                # self._logger.debug('Child was {:8.5f}. inheritance criterion was {:8.5f}'.format(child_r_squared, min(current_r_squared, mean(self._models[model_place][1]))))
-                if (child_r_squared < current_r_squared and child_r_squared <= mean(self._models[model_place][1]) + std(
-                        self._models[model_place][1])) or child_r_squared < current_r_squared * 0.80: # Also cannot inherit with < 80% of the current value, no matter what
-                    self._models[model_place][1] = np.append(self._models[model_place][1], current_r_squared)
-                    self._models[model_place][2] = rollback_model
-                    self._models[model_place][2].compile(optimizer='adam', loss='mse')
                 else:
+                    # inherit
                     self._models[model_place][1] = np.append(self._models[model_place][1], child_r_squared)
                     rollback_model = None
             else:
+                # rollback to parent, if it spawned a prodigy to incubate
+                try:
+                    self._models[model_place][1] = np.append(self._models[model_place][1], current_r_squared)
+                    self._models[model_place][2] = rollback_model
+                    self._models[model_place][2].compile(optimizer='adam', loss='mse')
+                except:
+                    self._logger.debug('Rolling back pool model {}'.format(model_place))
+                    self._logger.debug('Was {}'.format(self._models[model_place]))
                 rollback_model = None
 
             self._logger.info("model {} avg r {:6.5f}[{:}]: r2={:6.5f}: Child got {:6.5f}".format(model_place, mean(self._models[model_place][1]), self._models[model_place][1].size, current_r_squared, child_r_squared))
-            if child_replaced_another_line:
-                self._logger.info('Replaced line {}. Parent remains, parent fit={:6.5f}'. \
-                      format(worst_model_idx,
-                             mean(self._models[model_place][1]) - std(self._models[model_place][1]) / 2 + log(
-                                 self._models[model_place][1].size) / 1000))
-            elif (child_r_squared < current_r_squared and child_r_squared <= mean(self._models[model_place][1])) or child_r_squared < current_r_squared * 0.80:
-                self._logger.info('Child didn\'t inherit. Rolling mean now {:6.5f}, new fitness={:6.5f}'. \
-                      format(mean(self._models[model_place][1]),
-                             mean(self._models[model_place][1]) - std(self._models[model_place][1]) / 2 + log(
-                                 self._models[model_place][1].size) / 1000))
+            if child_should_incubate_a_new_line:
+                self._logger.info('Incubate new line. Rolling mean still  {:6.5f}, parent fitness={:6.5f}'. \
+                      format(mean(self._models[model_place][1]), self.model_fitness_score(self._models[model_place])))
+            elif (child_r_squared < current_r_squared and child_r_squared <= secondary_inheritance_requirement) or (child_r_squared < current_r_squared * 0.80 and current_r_squared > 0.0):
+                self._logger.info('Child didn\'t inherit. Rolling mean now {:6.5f}, new fitness={:6.5f}.' . \
+                      format(mean(self._models[model_place][1]), self.model_fitness_score(self._models[model_place])))
+                #self._logger.debug(self._models[model_place][1])
             else:
                 self._logger.info('Child inherited line. Rolling mean now {:6.5f}, new fitness={:6.5f}'. \
-                      format(mean(self._models[model_place][1]),
-                             mean(self._models[model_place][1]) - std(self._models[model_place][1]) / 2 + log(
-                                 self._models[model_place][1].size) / 1000))
+                      format(mean(self._models[model_place][1]), self.model_fitness_score(self._models[model_place])))
+                #self._logger.debug(self._models[model_place][1])
 
-            MIN_OOS_RSQUARED = min([mean(x[1]) for x in self._models])
-            MAX_OOS_RSQUARED = max([mean(x[1]) for x in self._models])
-
-            if not child_replaced_another_line:
+            if not child_should_incubate_a_new_line:
                 if Path('.\ES_model_loss_{}.csv'.format(model_place)).is_file():
-                    with open('.\ES_model_loss_{}.csv'.format(model_place), 'r+', encoding='utf-8') as f:
+                    with open('.\ES_model_loss_{}.csv'.format(model_place), "w") as f:
                         f.seek(0)
-                        f.write('{:9.6},{}'.format(mean(self._models[model_place][1]),
+                        f.write('{:9.6},{:d}'.format(mean(self._models[model_place][1]),
                                                    self._models[model_place][1].size))
                         f.close()
                 else:
                     with open('.\ES_model_loss_{}.csv'.format(model_place), "w") as f:
                         f.seek(0)
-                        f.write('{:9.6},{}'.format(mean(self._models[model_place][1]),
+                        f.write('{:9.6},{:d}'.format(mean(self._models[model_place][1]),
                                                   self._models[model_place][1].size))
                         f.close()
                 model.save('.\ES_model_{}'.format(model_place), save_format='h5')
 
             # train, evaluate, select
 
+        ######### Incubation pool breeding, drop them quickly if they don't pan out.
+        incubation_graduations = []
+        if len(self._incubation_pool) > 0:
+            self._logger.info('********** Incubator **********')
+        for loop in range(len(self._incubation_pool)):
+            baby_model = self._incubation_pool[loop][2]
+            predictions, current_r_squared, child_r_squared, current_model_score = self.before_and_after_models(self._incubation_pool, X, y, baby_model, loop, evalX, evaly)
+
+            rollback_model = clone_model(baby_model)
+
+            inc_pool_mode_rvals = self._incubation_pool[loop][1]
+            secondary_inheritance_requirement = mean(inc_pool_mode_rvals) + std(inc_pool_mode_rvals)
+            if (child_r_squared < current_r_squared and child_r_squared <= secondary_inheritance_requirement) or (child_r_squared < current_r_squared * 0.80 and current_r_squared > 0.0):
+                # rollback
+                self._incubation_pool[loop][1] = np.append(inc_pool_mode_rvals, current_r_squared)
+                self._incubation_pool[loop][2] = rollback_model
+                self._incubation_pool[loop][2].compile(optimizer='adam', loss='mse')
+            else:
+                self._incubation_pool[loop][1] = np.append(inc_pool_mode_rvals, child_r_squared)
+                rollback_model = None
+                # inherit - save 
+            if Path('.\incubating_model_loss_{}.csv'.format(loop)).is_file():
+                with open('.\incubating_model_loss_{}.csv'.format(loop), "w") as f:
+                    f.seek(0)
+                    f.write('{:9.6},{:d}'.format(mean(inc_pool_mode_rvals),inc_pool_mode_rvals.size))
+                    f.close()
+            else:
+                with open('.\incubating_model_loss_{}.csv'.format(loop), "w") as f:
+                    f.seek(0)
+                    f.write('{:9.6},{:d}'.format(mean(inc_pool_mode_rvals),inc_pool_mode_rvals.size))
+                    f.close()
+            baby_model.save('.\incubating_model_{}'.format(loop), save_format='h5')
+            
+            # Report what happened above 
+            if (child_r_squared < current_r_squared and child_r_squared <= secondary_inheritance_requirement) or (child_r_squared < current_r_squared * 0.80 and current_r_squared > 0.0):
+                self._logger.info('Incubating line {} child didn\'t inherit, {} old. Rolling mean now {:6.5f}, new fitness={:6.5f}'. \
+                      format(loop, len(self._incubation_pool[loop][1]), mean(self._incubation_pool[loop][1]), self.model_fitness_score(self._incubation_pool[loop])))
+            else:
+                self._logger.info('Incubating line {} child inherited line, {} old. Rolling mean now {:6.5f}, new fitness={:6.5f}'. \
+                      format(loop, len(self._incubation_pool[loop][1]), mean(self._incubation_pool[loop][1]), self.model_fitness_score(self._incubation_pool[loop])))
+
+            # Finalize items for this incubator operation loop
+            if self._incubation_pool[loop][1].size >= self.MIN_MODEL_MATURITY_TO_REPLACE and mean(self._incubation_pool[loop][1]) > MIN_OOS_RSQUARED:
+                incubation_graduations.append(self._incubation_pool[loop])
+                self._incubation_pool[loop] = None
+            elif mean(self._incubation_pool[loop][1]) < MIN_OOS_RSQUARED:
+                self._logger.info('Dropping incubated line {} due to inferior performance r-sq={:6.5f}'. \
+                    format(loop, mean(self._incubation_pool[loop][1])))
+                self._incubation_pool[loop] = None
+                
+        if len(self._incubation_pool) > 0:
+            self._logger.info('********** Incubator **********')
+
+        if len(incubation_graduations) > 0:
+            self._logger.info('***** Incubated replacements *****')
+        for loop in range(len(incubation_graduations)):
+            fitnesses = [self.model_fitness_score(x) for x in self._models]
+            least_fit_place = fitnesses.index(min(x for x in fitnesses))
+            
+            self._models[least_fit_place] = incubation_graduations[loop]
+            self._logger.info('Replacing line {} with incubated line of r-sq={:6.5f}, new fitness={:6.5f}'. \
+                format(least_fit_place, mean(self._models[least_fit_place][1]), self.model_fitness_score(self._models[least_fit_place])))
+            if Path('.\ES_model_loss_{}.csv'.format(least_fit_place)).is_file():
+                with open('.\ES_model_loss_{}.csv'.format(least_fit_place), "w") as f:
+                    f.seek(0)
+                    f.write('{:9.6},{:d}'.format(mean(self._models[least_fit_place][1]),len(self._models[least_fit_place][1])))
+                    f.close
+            else:
+                with open('.\ES_model_loss_{}.csv'.format(least_fit_place), "w") as f:
+                    f.seek(0)
+                    f.write('{:9.6},{:d}'.format(mean(self._models[least_fit_place][1]),len(self._models[least_fit_place][1])))
+                    f.close()
+            self._models[least_fit_place][2].save('.\ES_model_{}'.format(least_fit_place), save_format='h5')
+        if len(incubation_graduations) > 0:
+            self._logger.info('***** Incubated replacements *****')
+
+        incubation_graduations = []
+        self._incubation_pool = [x for x in self._incubation_pool if x is not None]
+
         K.clear_session()
 
         timeofday = datetime.datetime.now()
+
+
+    def before_and_after_models(self, collection, trainX, trainy, model, model_place, evalX, evaly):
+        predictions = model.predict(evalX, batch_size=1000, verbose=0)
+
+        slope, intercept, current_r_value, p_value, std_err = scipy.stats.linregress(
+            reshape(evaly, (1,-1)), reshape(predictions, (1,-1)))
+        current_r_squared = current_r_value*abs(current_r_value)
+
+        # Train
+        # Fit the next candidate model, call it the child, and find its out of sample r-squared
+        stopping_rule = [
+            EarlyStopping(
+                # Stop training when `loss` is no longer improving
+                monitor="loss",
+                # "no longer improving" being defined as "no better than 1e-2 less"
+                min_delta=1e-2,
+                # baseline=250,
+                # "no longer improving" being further defined as "for at least 10 epochs"
+                patience=60,
+                verbose=0,
+            )
+        ]
+
+        result = model.fit(trainX, trainy, epochs=2000, batch_size=1000, validation_data=(evalX, evaly), verbose=0,
+                           callbacks=stopping_rule)
+
+        # last_price = train_data["GC"][len(train_data["GC"])-1]
+        # logger.write('{},{},{},{}\n'.format(in_timeidx[len(in_timeidx) - 1],
+        #                                       result.history['loss'][len(result.history['loss']) - 1],
+        #                                       (yhat[0][0] - avg_out_obj_winsorized) * std_out_obj_winsorized,
+        #                                       GC_last_price))
+
+        # Evaluate child model for inheritance
+        predictions = model.predict(evalX, batch_size=1000, verbose=0)
+        slope, intercept, child_r_value, p_value, std_err = scipy.stats.linregress(
+            reshape(evaly, (1,-1)), reshape(predictions, (1,-1)))
+        child_r_squared = child_r_value*abs(child_r_value)
+
+        current_model_score = 0;
+#        self._logger.debug(type(models[model_place][1]))
+        if collection[model_place][1].size > 0:
+            current_model_score = self.model_fitness_score(self._models[model_place])
+
+        return predictions, current_r_squared, child_r_squared, current_model_score
+
+
+
+    def calculate_current_prediction(self):
+        obj_name = "ES"
+
+        train_means = {}
+        train_stds = {}
+        with open('CurrentStats.csv', encoding='utf-8') as fStats:
+            data = fStats.read().strip()
+            for rec in str.split(data, '\n', maxsplit=-1):
+                srec = str.split(rec, ',', maxsplit=-1)
+                avg_out = float(srec[0]) # Trend
+                avg_out_winsorized = float(srec[1]) # Skewness from trend
+                std_out_winsorized = float(srec[2]) # Second moment from trend
+                countfeatures = 0
+                for item in srec[3:]:
+                    item_parts = str.split(item, ':', maxsplit=-1)
+                    if item_parts[0].find('{') > -1:
+                        item_parts[0] = item_parts[0][item_parts[0].find('{')+1:]
+                    if item_parts[1].find('}') > -1:
+                        item_parts[1] = item_parts[1][0:item_parts[1].find('}')]
+                    item_parts[0] = item_parts[0].replace('\'', '')
+                    countfeatures = countfeatures + 1
+                    if countfeatures <= 9:
+                        train_means[item_parts[0].strip()] = float(item_parts[1])
+                    else:
+                        train_stds[item_parts[0].strip()] = float(item_parts[1])        
+
+        models_local = []
+        model_rs = [0] * self.MODEL_POOL_SIZE
+        for model_place in range(self.MODEL_POOL_SIZE):
+            modelfile = Path('.\{}_model_{}'.format(obj_name, model_place))
+            if modelfile.is_file():
+                mtime = modelfile.stat().st_mtime
+                model = keras.models.load_model('.\{}_model_{}'.format(obj_name, model_place))
+                model.compile(optimizer='adam', loss='mse')
+
+                if Path('.\{}_model_loss_{}.csv'.format(obj_name, model_place)).is_file():
+                    with open('.\{}_model_loss_{}.csv'.format(obj_name, model_place), encoding='utf-8') as f:
+                        data = f.read().strip()
+                        items = data.split(',')
+                        #print('Acquired new out of sample r-squared {:9.5f}, age={}'.format(float(items[0]), items[1]))
+                        r_sq = float(items[0])
+                        length = int(items[1])
+                        
+                models_local.append([model_place, array([r_sq] * length), model])
+                # self._logger.debug('Appended initial model from file to collection')
+                # self._logger.info('Loading models_local from {}_model_{} with {}'.format(obj_name, model_place, r_sq))
+            with open(str.format('ES_model_loss_{}.csv', model_place), encoding='utf-8') as fLoss:
+                try:
+                    data = fLoss.read().strip()
+                    items = str.split(data, ',', maxsplit=-1) # assumption: one line in loss file
+                    model_rs[model_place] = float(items[0])
+                except:
+                    continue
+
+        runtime = datetime.datetime.now()
+        current_data = self.load_current_data()
+
+        print(avg_out_winsorized, std_out_winsorized)
+
+        self.gauss_normalize_my_input_data(current_data, train_means, train_stds)
+        
+        self.pipeline_input_data(current_data)
+
+        obj_pl = [(x - avg_out_winsorized) / std_out_winsorized for x in current_data["OBJ"]]
+        obj_pl = array(obj_pl).reshape((self.NUM_TS_LAGS, 1))
+        today = array([current_data["ES"][len(current_data["ES"])-1],current_data["EC"][len(current_data["EC"])-1],current_data["GC"][len(current_data["GC"])-1],
+                       current_data["US"][len(current_data["US"])-1],current_data["BC"][len(current_data["BC"])-1],current_data["ESS"][len(current_data["ESS"])-1],
+                       current_data["ECS"][len(current_data["ECS"])-1],current_data["GCS"][len(current_data["GCS"])-1],current_data["USS"][len(current_data["USS"])-1]])
+        d_ES = current_data["ES"]
+        d_EC = current_data["EC"]
+        d_GC = current_data["GC"]
+        d_US = current_data["US"]
+        d_BC = current_data["BC"]
+        d_ESS = current_data["ESS"]
+        d_ECS = current_data["ECS"]
+        d_GCS = current_data["GCS"]
+        d_USS = current_data["USS"]
+        current_data = array([d_ES[len(d_ES) - 12], d_ES[len(d_ES) - 11], d_ES[len(d_ES) - 10],
+                         d_ES[len(d_ES) - 9], d_ES[len(d_ES) - 8], d_ES[len(d_ES) - 7],
+                         d_ES[len(d_ES) - 6], d_ES[len(d_ES) - 5], d_ES[len(d_ES) - 4],
+                         d_ES[len(d_ES) - 3], d_ES[len(d_ES) - 2], today[0],
+                         d_EC[len(d_EC) - 12], d_EC[len(d_EC) - 11], d_EC[len(d_EC) - 10],
+                         d_EC[len(d_EC) - 9], d_EC[len(d_EC) - 8], d_EC[len(d_EC) - 7],
+                         d_EC[len(d_EC) - 6], d_EC[len(d_EC) - 5], d_EC[len(d_EC) - 4],
+                         d_EC[len(d_EC) - 3], d_EC[len(d_EC) - 2], today[1],
+                         d_GC[len(d_GC) - 12], d_GC[len(d_GC) - 11], d_GC[len(d_GC) - 10],
+                         d_GC[len(d_GC) - 9], d_GC[len(d_GC) - 8], d_GC[len(d_GC) - 7],
+                         d_GC[len(d_GC) - 6], d_GC[len(d_GC) - 5], d_GC[len(d_GC) - 4],
+                         d_GC[len(d_GC) - 3], d_GC[len(d_GC) - 2], today[2],
+                         d_US[len(d_US) - 12], d_US[len(d_US) - 11], d_US[len(d_US) - 10],
+                         d_US[len(d_US) - 9], d_US[len(d_US) - 8], d_US[len(d_US) - 7],
+                         d_US[len(d_US) - 6], d_US[len(d_US) - 5], d_US[len(d_US) - 4],
+                         d_US[len(d_US) - 3], d_US[len(d_US) - 2], today[3],
+                         d_BC[len(d_BC) - 12], d_BC[len(d_BC) - 11], d_BC[len(d_BC) - 10],
+                         d_BC[len(d_BC) - 9], d_BC[len(d_BC) - 8], d_BC[len(d_BC) - 7],
+                         d_BC[len(d_BC) - 6], d_BC[len(d_BC) - 5], d_BC[len(d_BC) - 4],
+                         d_BC[len(d_BC) - 3], d_BC[len(d_BC) - 2], today[4],
+                         d_ESS[len(d_ESS) - 12], d_ESS[len(d_ESS) - 11],
+                         d_ESS[len(d_ESS) - 10], d_ESS[len(d_ESS) - 9], d_ESS[len(d_ESS) - 8],
+                         d_ESS[len(d_ESS) - 7], d_ESS[len(d_ESS) - 6], d_ESS[len(d_ESS) - 5],
+                         d_ESS[len(d_ESS) - 4], d_ESS[len(d_ESS) - 3], d_ESS[len(d_ESS) - 2],
+                         today[5],
+                         d_ECS[len(d_ECS) - 12], d_ECS[len(d_ECS) - 11],
+                         d_ECS[len(d_ECS) - 10], d_ECS[len(d_ECS) - 9], d_ECS[len(d_ECS) - 8],
+                         d_ECS[len(d_ECS) - 7], d_ECS[len(d_ECS) - 6], d_ECS[len(d_ECS) - 5],
+                         d_ECS[len(d_ECS) - 4], d_ECS[len(d_ECS) - 3], d_ECS[len(d_ECS) - 2],
+                         today[6],
+                         d_GCS[len(d_GCS) - 12], d_GCS[len(d_GCS) - 11],
+                         d_GCS[len(d_GCS) - 10], d_GCS[len(d_GCS) - 9], d_GCS[len(d_GCS) - 8],
+                         d_GCS[len(d_GCS) - 7], d_GCS[len(d_GCS) - 6], d_GCS[len(d_GCS) - 5],
+                         d_GCS[len(d_GCS) - 4], d_GCS[len(d_GCS) - 3], d_GCS[len(d_GCS) - 2],
+                         today[7],
+                         d_USS[len(d_USS) - 12], d_USS[len(d_USS) - 11],
+                         d_USS[len(d_USS) - 10], d_USS[len(d_USS) - 9], d_USS[len(d_USS) - 8],
+                         d_USS[len(d_USS) - 7], d_USS[len(d_USS) - 6], d_USS[len(d_USS) - 5],
+                         d_USS[len(d_USS) - 4], d_USS[len(d_USS) - 3], d_USS[len(d_USS) - 2],
+                         today[8]])
+
+        current_data = current_data.reshape((1, self.NUM_TS_LAGS, self.NUM_FEATURES))
+
+        with open('PythonOutput_ES_FiveFactor_FrontOnly.csv', "w") as fResults:
+            fResults.seek(0)
+            for loop in range(self.MODEL_POOL_SIZE):
+                # horizontally stack columns
+
+                model = models_local[loop][2]
+                model_place = loop
+
+                # n_features is the number of series added to x_input. i.e. self.NUM_FEATURES features
+                yhat = model.predict(current_data, verbose=0)
+                prediction = (yhat[0][0] + avg_out_winsorized) * std_out_winsorized
+
+                print("model {} predictive result {} = {:8.4f}, r_squared={:7.5f}".format(model_place, yhat, prediction, model_rs[model_place]))
+                
+                fResults.write('{:9.6f},{:7.4f}\n'.format(prediction, model_rs[model_place]))
+
+            fResults.close()
 
