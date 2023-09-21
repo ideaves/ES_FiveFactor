@@ -40,8 +40,8 @@ class ES_FiveFactor_LearningModelPool:
 
     def __init__(self):
 
-        self.DATASET_MAX = 20000
-        self.EVAL_SIZE = 5000
+        self.DATASET_MAX = 50000
+        self.EVAL_SIZE = 10000
         self.EVAL_OVERLAP = 0
         self.NUM_TS_LAGS = 12
         self.NUM_FEATURES = 9
@@ -52,8 +52,8 @@ class ES_FiveFactor_LearningModelPool:
         self.MAX_OOS_RSQUARED = -3.0
         self.MIN_OOS_RSQUARED = 0.0
         self.COUNTS_AS_SIGNIFICANT = 0.8
-        self.CLAMP_PEAK_OBJECTIVE = 0.7
-        self.MIN_MODEL_MATURITY_TO_REPLACE = 5
+        self.CLAMP_PEAK_OBJECTIVE = 0.6
+        self.MIN_MODEL_MATURITY_TO_REPLACE = 8
         self.MIN_MODEL_MATURITY_TO_REPRODUCE = 6
         self.MAX_MINRSQUARED_TO_SPAWN = 0.005
 
@@ -125,7 +125,9 @@ class ES_FiveFactor_LearningModelPool:
         while True:  # (((timeofday.hour == 5 and timeofday.minute > 30) or (timeofday.hour > 6)) and (timeofday.hour < 23)):
             all_data = self.load_latest_data()
 
-            out_obj = self.prepare_objective(all_data["OBJ"], all_data["timeidx"])
+            #print(all_data["OBJ"])
+            out_obj = self.prepare_objective(all_data["OBJ"], all_data["ROLL"], all_data["timeidx"])
+            #print(out_obj[len(out_obj)-5000:])
 
             inp = self.divide_input_data_into_two_parts(all_data, obj_name)
 
@@ -135,18 +137,21 @@ class ES_FiveFactor_LearningModelPool:
             train_stds = inp[3]
             in_timeidx = inp[4]
 
+            #print(self._eval_data["ES"])
 
             outp = self.divide_output_data_into_two_parts(out_obj)  
             self.out_train = outp[0]
             self.out_eval = outp[1]
             ftime = datetime.datetime.now()
 
+            #print(self.out_eval)
+
             avg_out_winsorized = mean(self.out_train)
             std_out_winsorized = std(self.out_train)
 
 
             if Path('.\CurrentStats.csv').is_file():
-                with open('.\CurrentStats.csv', 'r+', encoding='utf-8') as f:
+                with open('.\CurrentStats.csv', 'w', encoding='utf-8') as f:
                     f.seek(0)
                     f.write('{:9.6},{:9.6},{:9.6},{},{}'.format(mean(out_obj), avg_out_winsorized, std_out_winsorized, train_means, train_stds))
  
@@ -197,6 +202,11 @@ class ES_FiveFactor_LearningModelPool:
         model.summary()
 
 
+    def burn_down_lstm_longshorts(self, model):
+        
+        return
+
+
     def parse_input_data(self, data):
         in_timeidx = []
         in_ES = []
@@ -209,6 +219,10 @@ class ES_FiveFactor_LearningModelPool:
         in_USS = []
         in_BC = []
         out_obj = []
+        out_obj_roll = []
+
+        prev_obj_symbol = None
+        obj_symbol = None
         
         esprice = None
         ecprice = None
@@ -221,6 +235,7 @@ class ES_FiveFactor_LearningModelPool:
         usprice2 = None
         bcprice2 = None
         timesnap = None
+        rolled = False
         lastsnapshottime = None
 
         for rec in str.split(data, '\n', maxsplit=-1):
@@ -260,9 +275,12 @@ class ES_FiveFactor_LearningModelPool:
                 usspread = None
                 bcspread = None
                 timesnap = '{0} {1}:{2}:00'.format(datepart, hour, minute)
+                rolled = False
+
+            #print(esprice,ecprice,gcprice,usprice,bcprice,esprice2,ecprice2,gcprice2,usprice2,bcprice2,esspread,ecspread,gcspread,usspread,bcspread,timesnap)
 
             if symbol.find('ES') == 0:
-                esprice, esprice2, esspread = self.parse_ES_futures_price(strtime, symbol, strprice, esprice, esprice2)
+                esprice, esprice2, esspread, rolled = self.parse_ES_futures_price(strtime, obj_symbol, symbol, strprice, esprice, esprice2)
             elif symbol.find('EC') == 0:
                 ecprice, ecprice2, ecspread = self.parse_EC_futures_price(strtime, symbol, strprice, ecprice, ecprice2)
             elif symbol.find('GC') == 0:
@@ -271,8 +289,7 @@ class ES_FiveFactor_LearningModelPool:
                 usprice, usprice2, usspread = self.parse_US_futures_price(strtime, symbol, strprice, usprice, usprice2)
             elif symbol.find('BTC') == 0:
                 bcprice, bcprice2, bcspread = self.parse_BC_futures_price(strtime, symbol, strprice, bcprice, bcprice2)
-
-
+                
             if timesnap is not None and esprice is not None and esprice > 0 and ecprice is not None and ecprice > 0 \
                     and esprice2 is not None and esprice2 > 0 and ecprice2 is not None and ecprice2 > 0 \
                     and gcprice is not None and gcprice > 0 and usprice is not None and usprice > 0 \
@@ -289,6 +306,14 @@ class ES_FiveFactor_LearningModelPool:
                 in_GCS.append(gcspread)
                 in_USS.append(usspread)
                 in_timeidx.append(timesnap)
+                out_obj.append(esprice)
+                out_obj_roll.append(rolled)
+
+                if rolled and symbol.startswith('ES'):
+                    obj_symbol = symbol
+                    #print("Rolled:",prev_obj_symbol,obj_symbol, srec)
+                    prev_obj_symbol = obj_symbol
+                rolled = False
 
                 lastsnapshottime = timesnap
 
@@ -299,7 +324,8 @@ class ES_FiveFactor_LearningModelPool:
                 "ESS": in_ESS, "ECS": in_ECS, "GCS": in_GCS, "USS": in_USS,
                 "BC": in_BC,
                 "timeidx": in_timeidx,
-                "OBJ": in_ES}
+                "OBJ": out_obj,
+                "ROLL": out_obj_roll}
 
 
     def load_latest_data(self):    
@@ -325,8 +351,9 @@ class ES_FiveFactor_LearningModelPool:
             
 
 
-    def parse_ES_futures_price(self, strtime, symbol, strprice, esprice, esprice2):
+    def parse_ES_futures_price(self, strtime, last_obj_symbol, symbol, strprice, esprice, esprice2):
         esspread = None
+        roll = False
         ES_contracts = self.helper.Global_Futures_Dictionary["ES"]
         idx = 0;
         for x in ES_contracts._contracts:
@@ -339,13 +366,15 @@ class ES_FiveFactor_LearningModelPool:
             if symbol.find(front_contract[1]._symbol) > -1:
                 esprice = float(strprice)
                 if esprice2 is not None:
+                    if front_contract[1]._symbol != last_obj_symbol:
+                        roll = True
                     esspread = esprice - esprice2
             if symbol.find(second_contract[1]._symbol) > -1:
                 esprice2 = float(strprice)
                 if esprice is not None:
                     esspread = esprice - esprice2
             
-        return esprice, esprice2, esspread
+        return esprice, esprice2, esspread, roll
 
 
     def parse_NQ_futures_price(self, strtime, symbol, strprice, nqprice, nqprice2):
@@ -471,21 +500,38 @@ class ES_FiveFactor_LearningModelPool:
         return bcprice, bcprice2, bcspread
 
 
-    def prepare_objective(self, sequence, timestamps):
+    def prepare_objective(self, sequence, rolls, timestamps):
         leading = sequence[len(sequence) - 1]
         i = 0
         objective = []
         nexttime = datetime.datetime.strptime(timestamps[len(timestamps) - 1], '%Y-%m-%d %H:%M:%S')
+        next_num_periods_gap = 1
 
-        for price in reversed(sequence):
+        rev_seq = list(reversed(sequence))
+        #self.write_list_to_file("outp_rev_sequence",rev_seq)
+        rev_rolls = list(reversed(rolls))
+        #self.write_list_to_file("outp_rev_rolls",rev_rolls)
+        #ra = []
+        for place in range(len(rev_seq)):
+            price = rev_seq[place]
+            roll = rev_rolls[place]
             thistime = datetime.datetime.strptime(timestamps[len(timestamps) - i - 1], '%Y-%m-%d %H:%M:%S')
-            numperiods = max(1, int((nexttime - thistime).seconds / 5 / 60))
-            objective.append((leading - price) / price * 10000)
-            for j in range(numperiods):
-                leading = ((self.SUPERVISORY_AVERAGE_LEAD - 1) / self.SUPERVISORY_AVERAGE_LEAD) * leading + (
-                            1 / self.SUPERVISORY_AVERAGE_LEAD) * price
+            numperiods = max(1, int((nexttime - thistime).seconds / 5 / 60)) # number of 5 minute bars to skip in any gap
+            if not roll:
+                objective.append((leading - price) / price * 10000)
+            else:
+                objective.append(0.0)
+            for j in range(next_num_periods_gap):
+                if not roll:
+                    leading = ((self.SUPERVISORY_AVERAGE_LEAD - 1.0) / self.SUPERVISORY_AVERAGE_LEAD) * leading + (
+                            1.0 / self.SUPERVISORY_AVERAGE_LEAD) * price
+                else:
+                    leading = price
+            #ra.append('rev_seq place={} i={} ts place={} thistime={} numperiods={} price={} roll={} leading={} objective={}'.format(place, i, len(timestamps) - i - 1, thistime, numperiods, price, roll, leading, (leading - price) / price * 10000))
             nexttime = thistime
+            next_num_periods_gap = numperiods
             i += 1
+        #self.write_list_to_file("reversal_algorithm.csv",ra)
         return list(reversed(objective))
 
 
@@ -539,17 +585,13 @@ class ES_FiveFactor_LearningModelPool:
         mean_in_US = mean(all_data["US"])
         std_in_US = std(all_data["US"])
 
-        eval_USS = all_data["USS"].copy()[len(all_data["USS"]) - self.EVAL_SIZE - self.EVAL_OVERLAP - 1:len(
-            all_data["USS"]) - 1]
-        in_USS = all_data["USS"][len(all_data["USS"]) - self.DATASET_MAX - self.EVAL_SIZE - 2:len(
-            all_data["USS"]) - self.EVAL_SIZE - 2]
+        eval_USS = all_data["USS"].copy()[len(all_data["USS"]) - self.EVAL_SIZE - self.EVAL_OVERLAP - 1:len(all_data["USS"]) - 1]
+        in_USS = all_data["USS"][len(all_data["USS"]) - self.DATASET_MAX - self.EVAL_SIZE - 2:len(all_data["USS"]) - self.EVAL_SIZE - 2]
         mean_in_USS = mean(all_data["USS"])
         std_in_USS = std(all_data["USS"])
 
-        eval_BC = all_data["BC"].copy()[len(all_data["BC"]) - self.EVAL_SIZE - self.EVAL_OVERLAP - 1:len(
-            all_data["BC"]) - 1]
-        in_BC = all_data["BC"][len(all_data["BC"]) - self.DATASET_MAX - self.EVAL_SIZE - 2:len(
-            all_data["BC"]) - self.EVAL_SIZE - 2]
+        eval_BC = all_data["BC"].copy()[len(all_data["BC"]) - self.EVAL_SIZE - self.EVAL_OVERLAP - 1:len(all_data["BC"]) - 1]
+        in_BC = all_data["BC"][len(all_data["BC"]) - self.DATASET_MAX - self.EVAL_SIZE - 2:len(all_data["BC"]) - self.EVAL_SIZE - 2]
         mean_in_BC = mean(all_data["BC"])
         std_in_BC = std(all_data["BC"])
 
@@ -562,6 +604,13 @@ class ES_FiveFactor_LearningModelPool:
         train_stds = {"ES": std_in_ES, "ESS": std_in_ESS, "EC": std_in_EC, "ECS": std_in_ECS, "GC": std_in_GC, "GCS": std_in_GCS, "US": std_in_US, "USS": std_in_USS, "BC": std_in_BC}
 
         return [train_data, eval_data, train_means, train_stds, in_timeidx]
+
+
+    def write_list_to_file(self, filename, data):
+        with open(filename, 'w') as f:
+            for x in data:
+                f.write('\n{0}'.format(x))
+
 
 
     def divide_output_data_into_two_parts(self, objective):
@@ -596,13 +645,6 @@ class ES_FiveFactor_LearningModelPool:
                 sequence[pos] = myabsbound * proportion
             elif element < 0 and element < -myabsbound * proportion:
                 sequence[pos] = -myabsbound * proportion
-            pos += 1
-        pos = 0
-        for element in alt_sequence:
-            if element > 0 and element > myabsbound * proportion:
-                alt_sequence[pos] = myabsbound * proportion
-            elif element < 0 and element < -myabsbound * proportion:
-                alt_sequence[pos] = -myabsbound * proportion
             pos += 1
     #    with open('C:\\Users\\ideav\\Documents\\PythonWork\\FiveFactor\\sequence.csv', 'w') as f:
     #        f.write('\n{0}'.format(sequence))
@@ -691,10 +733,14 @@ class ES_FiveFactor_LearningModelPool:
             # predict using the before model (call this the parent)
             predictions, current_r_squared, child_r_squared, current_model_score = self.before_and_after_models(self._models, X, y, model, model_place, evalX, evaly)
 
-            # Max/min of all the model means 
+            # Max/min of all the model means
+            r_values = [mean(x[1]) for x in self._models]
+            r_values.sort()
             if len(self._models) > 0:
-                MAX_OOS_RSQUARED = max(mean(x[1]) for x in self._models)
-                MIN_OOS_RSQUARED = min(mean(x[1]) for x in self._models)
+                alt_incubation_dropout_criterion = r_values[1]
+                others = [y for y in self._models if y[0] != model_place]
+                MAX_OOS_RSQUARED = max(mean(x[1]) for x in others)
+                MIN_OOS_RSQUARED = min(r_values)
 
             rollback_model = clone_model(model)
             
@@ -704,7 +750,8 @@ class ES_FiveFactor_LearningModelPool:
             child_should_incubate_a_new_line = False
 
             # Mature enough to spawn, and child is a prodigy
-            if self._models[model_place][1].size >= self.MIN_MODEL_MATURITY_TO_REPRODUCE and child_r_squared > (MAX_OOS_RSQUARED) and MIN_OOS_RSQUARED < self.MAX_MINRSQUARED_TO_SPAWN:
+            # To minimize impoverishment spinning off badly needed children. Only spawn if the line would not suffer too badly. Try a fixed zero bound.
+            if self._models[model_place][1].size >= self.MIN_MODEL_MATURITY_TO_REPRODUCE and child_r_squared > (MAX_OOS_RSQUARED) and current_r_squared > 0.0 and MIN_OOS_RSQUARED < self.MAX_MINRSQUARED_TO_SPAWN:
                 inc_place = len(self._incubation_pool)
                 self._incubation_pool.append([inc_place, array(child_r_squared), clone_model(model)])
                 self._incubation_pool[inc_place][2].compile(optimizer='adam', loss='mse')
@@ -742,7 +789,7 @@ class ES_FiveFactor_LearningModelPool:
                     self._logger.debug('Was {}'.format(self._models[model_place]))
                 rollback_model = None
 
-            self._logger.info("model {} avg r {:6.5f}[{:}]: r2={:6.5f}: Child got {:6.5f}".format(model_place, mean(self._models[model_place][1]), self._models[model_place][1].size, current_r_squared, child_r_squared))
+            self._logger.info("Line {} avg r {:6.5f}[{:}]: r={:6.5f}: Child got {:6.5f}".format(model_place, mean(self._models[model_place][1]), self._models[model_place][1].size, current_r_squared, child_r_squared))
             if child_should_incubate_a_new_line:
                 self._logger.info('Incubate new line. Rolling mean still  {:6.5f}, parent fitness={:6.5f}'. \
                       format(mean(self._models[model_place][1]), self.model_fitness_score(self._models[model_place])))
@@ -774,6 +821,9 @@ class ES_FiveFactor_LearningModelPool:
 
         ######### Incubation pool breeding, drop them quickly if they don't pan out.
         incubation_graduations = []
+        fitnesses = [self.model_fitness_score(x) for x in self._models]
+        least_fit_place = fitnesses.index(min(x for x in fitnesses))
+
         if len(self._incubation_pool) > 0:
             self._logger.info('********** Incubator **********')
         for loop in range(len(self._incubation_pool)):
@@ -814,12 +864,13 @@ class ES_FiveFactor_LearningModelPool:
                       format(loop, len(self._incubation_pool[loop][1]), mean(self._incubation_pool[loop][1]), self.model_fitness_score(self._incubation_pool[loop])))
 
             # Finalize items for this incubator operation loop
-            if self._incubation_pool[loop][1].size >= self.MIN_MODEL_MATURITY_TO_REPLACE and mean(self._incubation_pool[loop][1]) > MIN_OOS_RSQUARED:
+            if self._incubation_pool[loop][1].size >= self.MIN_MODEL_MATURITY_TO_REPLACE and mean(self._incubation_pool[loop][1]) > alt_incubation_dropout_criterion and self.model_fitness_score(self._models[least_fit_place]) <= self.model_fitness_score(self._incubation_pool[loop]):
                 incubation_graduations.append(self._incubation_pool[loop])
                 self._incubation_pool[loop] = None
-            elif mean(self._incubation_pool[loop][1]) < MIN_OOS_RSQUARED:
-                self._logger.info('Dropping incubated line {} due to inferior performance r-sq={:6.5f}'. \
-                    format(loop, mean(self._incubation_pool[loop][1])))
+            elif mean(self._incubation_pool[loop][1]) <= alt_incubation_dropout_criterion or \
+                (self._incubation_pool[loop][1].size >= self.MIN_MODEL_MATURITY_TO_REPLACE and self.model_fitness_score(self._models[least_fit_place]) > self.model_fitness_score(self._incubation_pool[loop])):
+                self._logger.info('Dropping incubated line {} due to inferior performance r-sq={:6.5f}, fitness={:6.5f}'. \
+                    format(loop, mean(self._incubation_pool[loop][1]), self.model_fitness_score(self._incubation_pool[loop])))
                 self._incubation_pool[loop] = None
                 
         if len(self._incubation_pool) > 0:
@@ -827,10 +878,7 @@ class ES_FiveFactor_LearningModelPool:
 
         if len(incubation_graduations) > 0:
             self._logger.info('***** Incubated replacements *****')
-        for loop in range(len(incubation_graduations)):
-            fitnesses = [self.model_fitness_score(x) for x in self._models]
-            least_fit_place = fitnesses.index(min(x for x in fitnesses))
-            
+        for loop in range(len(incubation_graduations)):            
             self._models[least_fit_place] = incubation_graduations[loop]
             self._logger.info('Replacing line {} with incubated line of r-sq={:6.5f}, new fitness={:6.5f}'. \
                 format(least_fit_place, mean(self._models[least_fit_place][1]), self.model_fitness_score(self._models[least_fit_place])))
@@ -872,8 +920,8 @@ class ES_FiveFactor_LearningModelPool:
                 # "no longer improving" being defined as "no better than 1e-2 less"
                 min_delta=1e-2,
                 # baseline=250,
-                # "no longer improving" being further defined as "for at least 10 epochs"
-                patience=60,
+                # "no longer improving" being further defined as "for at least N epochs"
+                patience=50,
                 verbose=0,
             )
         ]
@@ -896,7 +944,7 @@ class ES_FiveFactor_LearningModelPool:
         current_model_score = 0;
 #        self._logger.debug(type(models[model_place][1]))
         if collection[model_place][1].size > 0:
-            current_model_score = self.model_fitness_score(self._models[model_place])
+            current_model_score = self.model_fitness_score(collection[model_place])
 
         return predictions, current_r_squared, child_r_squared, current_model_score
 
@@ -959,68 +1007,24 @@ class ES_FiveFactor_LearningModelPool:
         runtime = datetime.datetime.now()
         current_data = self.load_current_data()
 
-        print(avg_out_winsorized, std_out_winsorized)
+        #print(avg_out_winsorized, std_out_winsorized)
 
         self.gauss_normalize_my_input_data(current_data, train_means, train_stds)
         
         self.pipeline_input_data(current_data)
 
-        obj_pl = [(x - avg_out_winsorized) / std_out_winsorized for x in current_data["OBJ"]]
-        obj_pl = array(obj_pl).reshape((self.NUM_TS_LAGS, 1))
-        today = array([current_data["ES"][len(current_data["ES"])-1],current_data["EC"][len(current_data["EC"])-1],current_data["GC"][len(current_data["GC"])-1],
-                       current_data["US"][len(current_data["US"])-1],current_data["BC"][len(current_data["BC"])-1],current_data["ESS"][len(current_data["ESS"])-1],
-                       current_data["ECS"][len(current_data["ECS"])-1],current_data["GCS"][len(current_data["GCS"])-1],current_data["USS"][len(current_data["USS"])-1]])
-        d_ES = current_data["ES"]
-        d_EC = current_data["EC"]
-        d_GC = current_data["GC"]
-        d_US = current_data["US"]
-        d_BC = current_data["BC"]
-        d_ESS = current_data["ESS"]
-        d_ECS = current_data["ECS"]
-        d_GCS = current_data["GCS"]
-        d_USS = current_data["USS"]
-        current_data = array([d_ES[len(d_ES) - 12], d_ES[len(d_ES) - 11], d_ES[len(d_ES) - 10],
-                         d_ES[len(d_ES) - 9], d_ES[len(d_ES) - 8], d_ES[len(d_ES) - 7],
-                         d_ES[len(d_ES) - 6], d_ES[len(d_ES) - 5], d_ES[len(d_ES) - 4],
-                         d_ES[len(d_ES) - 3], d_ES[len(d_ES) - 2], today[0],
-                         d_EC[len(d_EC) - 12], d_EC[len(d_EC) - 11], d_EC[len(d_EC) - 10],
-                         d_EC[len(d_EC) - 9], d_EC[len(d_EC) - 8], d_EC[len(d_EC) - 7],
-                         d_EC[len(d_EC) - 6], d_EC[len(d_EC) - 5], d_EC[len(d_EC) - 4],
-                         d_EC[len(d_EC) - 3], d_EC[len(d_EC) - 2], today[1],
-                         d_GC[len(d_GC) - 12], d_GC[len(d_GC) - 11], d_GC[len(d_GC) - 10],
-                         d_GC[len(d_GC) - 9], d_GC[len(d_GC) - 8], d_GC[len(d_GC) - 7],
-                         d_GC[len(d_GC) - 6], d_GC[len(d_GC) - 5], d_GC[len(d_GC) - 4],
-                         d_GC[len(d_GC) - 3], d_GC[len(d_GC) - 2], today[2],
-                         d_US[len(d_US) - 12], d_US[len(d_US) - 11], d_US[len(d_US) - 10],
-                         d_US[len(d_US) - 9], d_US[len(d_US) - 8], d_US[len(d_US) - 7],
-                         d_US[len(d_US) - 6], d_US[len(d_US) - 5], d_US[len(d_US) - 4],
-                         d_US[len(d_US) - 3], d_US[len(d_US) - 2], today[3],
-                         d_BC[len(d_BC) - 12], d_BC[len(d_BC) - 11], d_BC[len(d_BC) - 10],
-                         d_BC[len(d_BC) - 9], d_BC[len(d_BC) - 8], d_BC[len(d_BC) - 7],
-                         d_BC[len(d_BC) - 6], d_BC[len(d_BC) - 5], d_BC[len(d_BC) - 4],
-                         d_BC[len(d_BC) - 3], d_BC[len(d_BC) - 2], today[4],
-                         d_ESS[len(d_ESS) - 12], d_ESS[len(d_ESS) - 11],
-                         d_ESS[len(d_ESS) - 10], d_ESS[len(d_ESS) - 9], d_ESS[len(d_ESS) - 8],
-                         d_ESS[len(d_ESS) - 7], d_ESS[len(d_ESS) - 6], d_ESS[len(d_ESS) - 5],
-                         d_ESS[len(d_ESS) - 4], d_ESS[len(d_ESS) - 3], d_ESS[len(d_ESS) - 2],
-                         today[5],
-                         d_ECS[len(d_ECS) - 12], d_ECS[len(d_ECS) - 11],
-                         d_ECS[len(d_ECS) - 10], d_ECS[len(d_ECS) - 9], d_ECS[len(d_ECS) - 8],
-                         d_ECS[len(d_ECS) - 7], d_ECS[len(d_ECS) - 6], d_ECS[len(d_ECS) - 5],
-                         d_ECS[len(d_ECS) - 4], d_ECS[len(d_ECS) - 3], d_ECS[len(d_ECS) - 2],
-                         today[6],
-                         d_GCS[len(d_GCS) - 12], d_GCS[len(d_GCS) - 11],
-                         d_GCS[len(d_GCS) - 10], d_GCS[len(d_GCS) - 9], d_GCS[len(d_GCS) - 8],
-                         d_GCS[len(d_GCS) - 7], d_GCS[len(d_GCS) - 6], d_GCS[len(d_GCS) - 5],
-                         d_GCS[len(d_GCS) - 4], d_GCS[len(d_GCS) - 3], d_GCS[len(d_GCS) - 2],
-                         today[7],
-                         d_USS[len(d_USS) - 12], d_USS[len(d_USS) - 11],
-                         d_USS[len(d_USS) - 10], d_USS[len(d_USS) - 9], d_USS[len(d_USS) - 8],
-                         d_USS[len(d_USS) - 7], d_USS[len(d_USS) - 6], d_USS[len(d_USS) - 5],
-                         d_USS[len(d_USS) - 4], d_USS[len(d_USS) - 3], d_USS[len(d_USS) - 2],
-                         today[8]])
-
-        current_data = current_data.reshape((1, self.NUM_TS_LAGS, self.NUM_FEATURES))
+        #print(current_data["ES"])
+        current_data = hstack((current_data["ES"],
+                          current_data["EC"],
+                          current_data["GC"],
+                          current_data["US"],
+                          current_data["BC"],
+                          current_data["ESS"],
+                          current_data["ECS"],
+                          current_data["GCS"],
+                          current_data["USS"],
+                          [[0],[0],[0],[0],[0],[0],[0],[0],[0],[0],[0],[0]]))
+        curr_x, useless = self.split_sequences(current_data, self.NUM_TS_LAGS, 1)
 
         with open('PythonOutput_ES_FiveFactor_FrontOnly.csv', "w") as fResults:
             fResults.seek(0)
@@ -1031,12 +1035,14 @@ class ES_FiveFactor_LearningModelPool:
                 model_place = loop
 
                 # n_features is the number of series added to x_input. i.e. self.NUM_FEATURES features
-                yhat = model.predict(current_data, verbose=0)
-                prediction = (yhat[0][0] + avg_out_winsorized) * std_out_winsorized
+                yhat = model.predict(curr_x, verbose=0)
+                print(yhat)
+                prediction = (yhat[0][0] + avg_out_winsorized) * std_out_winsorized + avg_out
 
                 print("model {} predictive result {} = {:8.4f}, r_squared={:7.5f}".format(model_place, yhat, prediction, model_rs[model_place]))
                 
                 fResults.write('{:9.6f},{:7.4f}\n'.format(prediction, model_rs[model_place]))
 
             fResults.close()
+
 
